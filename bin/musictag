@@ -3,12 +3,28 @@ use strict;
 use Music::Tag;
 use Getopt::Long;
 use File::Spec;
+use File::Util;
+use File::Basename;
 use Data::Dumper;
 use Config::Options;
 use Pod::Usage;
-use utf8;
+use open qw(:std :utf8);
+use Scalar::Util qw(looks_like_number);
+use Cwd;
 
-our $VERSION  = .40_01;
+# Let's report a stack trace on failure!
+$SIG{__DIE__} = sub {
+    die @_ if ( $^S or not defined $^S );
+    my $i = 0;
+    print STDERR "Stack Trace: \n";
+    while ((my @call_details = (caller($i++)))) {
+	print STDERR $call_details[1].":".$call_details[2]." in function ".$call_details[3]."\n";
+    }
+    exit 1;
+};
+
+
+our $VERSION  = .40_02;
 our $options  = Config::Options->new();
 our $BASENAME = "musictag";
 if ( $^X =~ /\/*([^\/]*)$/ ) {
@@ -29,7 +45,7 @@ $options->options(
        ignore_apic   => 1,
        optionfile    =>
          [ $ENV{HOME} . "/.musictag/default.conf", $ENV{HOME} . "/.musictag/$BASENAME.conf" ],
-       sort_regex => '[^A-Za-z0-9 _\-]',
+       sort_regex => '',
        getinfo    => "",
        presets    => {
            clean => {
@@ -56,7 +72,7 @@ $options->options(
                          },
                   },
     }
-);
+    );
 
 my $cloptions = { plugins => [], outputplugins => [], inputplugins => [] };
 our $clopts = [
@@ -147,7 +163,7 @@ our $clopts = [
        "sort without spaces"
     ],
     [  "sort_regex=s" => \$cloptions->{sort_regex},
-       "Regex of characters to convert to underscore in filenames when sorting"
+       "Regex to strip filenames when sorting"
     ],
     [  "printoptions" => \$cloptions->{printoptions},
        "Dump current options"
@@ -255,7 +271,8 @@ if ( $cloptions->{stdin} ) {
 }
 
 foreach (@FILES) {
-    s/[^A-Za-z0-9]+$//g;
+    #remove whitespace from end...
+    s/\W+$//g;
     if ( -d $_ ) {
         fix_dir($_);
     }
@@ -281,7 +298,7 @@ sub help {
             print "\nAvailable Preset Options:\n";
         }
 
-        my $command = $_->[0];
+	my $command = $_->[0];
         my %longhelp = ( s => "VALUE", i => "INT", 's@' => "VALUE", 's%' => "KEY=VALUE" );
         $command =~ s/=(.+)$/'='. $longhelp{$1}/e;
         printf "--%-22s  %s\n", $command, $_->[2];
@@ -366,15 +383,16 @@ sub fix_file {
                         tracknum => $info->tracknum
                       };
 
-    my @statback = stat($filename);
+    my @statback = stat([ $filename ]);
 
     my @inputplugins  = ();
     my @outputplugins = ();
 
     if ( scalar @{ $options->{inputplugins} } ) {
         foreach ( @{ $options->{inputplugins} } ) {
-            if ( $options->{verbose} ) { print "Adding input plugin $_"; }
-            push @inputplugins, $info->add_plugin( $_, plugin_opts($_) );
+	    my $pname = $_;
+            if ( $options->{verbose} ) { print "Adding input plugin $pname\n";}
+            push @inputplugins, $info->add_plugin( $pname, plugin_opts($pname) );
         }
     }
 
@@ -402,7 +420,7 @@ sub fix_file {
 
     if ( scalar @{ $options->{outputplugins} } ) {
         foreach ( @{ $options->{outputplugins} } ) {
-            if ( $options->{verbose} ) { print "Adding output plugin $_"; }
+           if ( $options->{verbose} ) { print "Adding output plugin $_"; }
             push @outputplugins, $info->add_plugin( $_, plugin_opts($_) );
         }
     }
@@ -415,6 +433,20 @@ sub fix_file {
         $_->get_tag();
     }
 
+    if ( $options->{sort_regex} && $info->title ) {
+	my $regex = $options->{sort_regex};
+	my $title = $info->title;
+	$title =~ s/${regex}//g;
+	$info->title($title);
+    }
+
+    if ((! defined $info->album || ! length $info->album) &&
+	(! defined $info->artist || ! length $info->artist) &&
+	(! defined $info->performer || ! length $info->performer)) {
+	# basically if no tags are set, let's see if we can figure them out
+	print $filename."\n";
+    }
+
     if ( $options->{safe} ) {
         unshift @outputplugins, $info->add_plugin( "Option", $backup_info );
     }
@@ -424,6 +456,7 @@ sub fix_file {
             $_->strip_tag();
         }
     }
+
 
     if ( $info->changed or $options->{forcechange} ) {
         foreach (@outputplugins) {
@@ -456,42 +489,39 @@ sub fix_file {
 sub do_move {
     my $info = shift;
     my $file = $info->filename;
-    my ( $dest, $path ) = get_dest($info);
+    my ($dest, $path) = get_dest($info);
     return unless $path;
     unless ( -d $path ) {
-        print "mkdir -p $path\n";
-        system( "mkdir", "-p", "$path" );
+        system( "mkdir", "-pv", "$path" );
     }
     if ( -e $dest ) {
-        print "$dest exists, checking bitrate\n";
         my $dinfo = Music::Tag->new($dest)->get_tag();
         if ( $dinfo && $info ) {
-            print "$file: ", $info->bitrate, " $dest: ", $dinfo->bitrate, "\n";
             if ( $dinfo->bitrate >= $info->bitrate ) {
-                print "Destination is equal or greater than source, not replacing\n";
+                print "Destination exists and is equal or greater than source, not replacing\n";
                 return undef;
             }
         }
         print "Destination is lower bitrate, replacing\n";
     }
     if ( $options->{move} ) {
-        print "mv $file $dest\n";
-        system( "mv", "-f", "$file", "$dest" );
+	print "Moving: ";
+        system( "mv", "-fv", "$file", "$dest" );
         return 1;
     }
     if ( $options->{ln} ) {
-        print "ln $file $dest\n";
-        system( "ln", "$file", "$dest" );
+	print "Linking: ";
+        system( "ln", "-v", "$file", "$dest" );
         return 2;
     }
     if ( $options->{lns} ) {
-        print "ln -s $file $dest\n";
-        system( "ln", "-s", "$file", "$dest" );
+	print "Sym-Linking: ";
+        system( "ln", "-sv", "$file", "$dest" );
         return 3;
     }
     if ( $options->{cp} ) {
-        print "cp $file $dest\n";
-        system( "cp", "$file", "$dest" );
+	print "Copying: ";
+        system( "cp", "-v", "$file", "$dest" );
         return 4;
     }
     return;
@@ -511,32 +541,118 @@ sub print_info {
     }
 }
 
+sub smartCaps {
+    my $line = shift;
+
+    my @small_words = qw( (?<!q&)a an and as at(?!&t) but by en for if in of on or the to v[.]? via vs[.]? );
+    my $small_re = join '|', @small_words;
+
+    my $apos = qr/ (?: ['’] [[:lower:]]* )? /x;
+
+    $line =~ s{\A\s+}{}, s{\s+\z}{};
+    $line = lc $line if not $line =~ /[[:lower:]]/;
+
+    $line =~ s{
+    	     \b (_*) (?:
+             ( (?<=[ ][/\\]) [[:alpha:]]+ [-_[:alpha:]/\\]+ |   # file path or
+               [-_[:alpha:]]+ [@.:] [-_[:alpha:]@.:/]+ $apos )  # URL, domain, or email
+             |
+             ( (?i: $small_re ) $apos )                         # or small word (case-insensitive)
+             |
+             ( [[:alpha:]] [[:lower:]'’()\[\]{}]* $apos )       # or word w/o internal caps
+        |
+        ( [[:alpha:]] [[:alpha:]'’()\[\]{}]* $apos )       # or some other word
+        ) (_*) \b
+    }{
+    $1 . (
+              defined $2 ? $2         # preserve URL, domain, or email
+              : defined $3 ? "\L$3"     # lowercase small word
+              : defined $4 ? "\u\L$4"   # capitalize word w/o internal caps
+              : $5                      # preserve other kinds of word
+        ) . $6
+    }xeg;
+
+
+    # Exceptions for small words: capitalize at start and end of title
+    $line =~ s{
+    (  \A [[:punct:]]*         # start of title...
+       |  [:.;?!\d][ ]+             # or of subsentence... #SLR after number
+       |  [ ]['"“‘(\[][ ]*     )  # or of inserted subphrase...
+            ( $small_re ) \b           # ... followed by small word
+    }{$1\u\L$2}xig;
+
+    $line =~ s{
+    \b ( $small_re )      # small word...
+        (?= [[:punct:]]* \Z   # ... at the end of the title...
+         |   ['"’”)\]] [ ] )   # ... or of an inserted subphrase?
+    }{\u\L$1}xig;
+
+    # Exceptions for small words in hyphenated compound words
+    ## e.g. "in-flight" -> In-Flight
+    # Negative lookbehind for a hyphen; we don't want to match man-in-the-middle but do want (in-flight)
+    $line =~ s{
+    	  \b
+        (?<! -)
+        ( $small_re )
+        (?= -[[:alpha:]]+)              # lookahead for "-someword"
+    }{\u\L$1}xig;
+
+    ## # e.g. "Stand-in" -> "Stand-In" (Stand is already capped at this point)
+    # Negative lookbehind for a hyphen; we don't want to match man-in-the-middle but do want (stand-in)
+    $line =~ s{
+    \b
+        (?<!…)
+        ( [[:alpha:]]+- )               # $1 = first word and hyphen, should already be properly capped
+        ( $small_re )           # ... followed by small word
+        (?!     - )                                     # Negative lookahead for another '-'
+    }{$1\u$2}xig;
+    return "$line";
+}
+
+
 sub get_dest {
     my $info     = shift;
-    my $filename = $info->filename();
-    $filename =~ /\.([^\.]+)$/;
-    my $suffix = $1 || "mp3";
+    my ($filename, $opath, $suffix) = fileparse($info->filename(), qr/\.[^.]*/);
+    $suffix = lc($suffix);
+    my $dpath = $options->{dest};
+    my $dfile = $filename.$suffix;
     if ($info) {
-        my @dpath =
-          ( $options->{dest}, filename_clean( $info->artist ), filename_clean( $info->album ) );
-        my $dfile = filename_clean( $info->title );
-        if ( $info->track ) {
-            $dfile = $info->track . "-" . $dfile;
-        }
-        $dfile .= "." . $suffix;
-        return File::Spec->catfile( @dpath, $dfile ), File::Spec->catdir(@dpath);
+	my $album = filename_clean($info->album);
+	my $artist = filename_clean($info->artist);
+	$artist = filename_clean($info->performer) if (! $artist && $info->performer);
+	my $track = filename_clean($info->track);
+	$track = sprintf("%02s", $track) if (looks_like_number($track) && $track > 0);
+	my $title = smartCaps(filename_clean($info->title));
+	$dpath = File::Spec->catdir($dpath, $artist) if ($artist);
+	$dpath = File::Spec->catdir($dpath, $album) if ($album);
+	if ( $title && ($track || $artist || $album)) {
+	    my @destfile;
+	    push(@destfile, $track) if ($track);
+	    push(@destfile, $artist) if ($artist);
+	    #push(@destfile, $album) if ($album);
+	    push(@destfile, $title);
+	    $dfile = join(' - ', @destfile) . $suffix;
+	}  else {
+	    return undef, undef;
+	    # if there is no title, let's just clean original filename
+#	    $dfile =~ s/^\d{1,3}\W+\-\W+//g;
+#	    $dfile =~ s/^\W+//g;
+#	    $dpath = File::Spec->catdir($options->{dest}, "Various") if (! $album);
+	}
+        return File::Spec->catfile($dpath, $dfile), File::Spec->catdir($dpath);
     }
-    return undef;
+    return File::Spec->catfile($dpath, $dfile), File::Spec->catdir($dpath);
 }
 
 sub filename_clean {
     my $in    = shift;
     my $regex = $options->{sort_regex};
-    $in =~ s/$regex/_/g;
-    $in =~ s/[^A-Za-z0-9 \-_]/_/g;
+    $in =~ s/$regex//g if (length($regex) > 0);
+#    $in = smartCaps($in);
+    $in = File::Util::escape_filename($in, '_');
     if ( $options->{nospace} ) {
-        $in =~ s/ /_/g;
-        $in = lc($in);
+	$in =~ s/ /_/g;
+	$in = lc($in);
     }
     return $in;
 }
@@ -657,11 +773,11 @@ Sleep between iterations.  Keeps you from hammering Amazon or MusicBrainz.
 
 =item --lyricsoverwrite
 
-Overwrite lyrics already saved. 
+Overwrite lyrics already saved.
 
 =item --coveroverwrite
 
-Overwrite cover artwork already saved.  
+Overwrite cover artwork already saved.
 
 =item --forcechange
 
@@ -830,7 +946,7 @@ Configuration file is located at ~/.musictag/default.conf. See sample/default.co
 L<Music::Tag::Amazon>, L<Music::Tag::File>, L<Music::Tag::FLAC>, L<Music::Tag::Lyrics>,
 L<Music::Tag::M4A>, L<Music::Tag::MP3>, L<Music::Tag::MusicBrainz>, L<Music::Tag::OGG>, L<Music::Tag::Option>
 
-=head1 AUTHOR 
+=head1 AUTHOR
 
 Edward Allen III <ealleniii _at_ cpan _dot_ org>
 
